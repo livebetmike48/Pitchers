@@ -139,6 +139,20 @@ class StartersBot(discord.Client):
         )
         self.tree.add_command(starters_cmd)
 
+        hotstarters_cmd = app_commands.Command(
+            name="hotstarters",
+            description="Which probable starters for a date are trending hot (last 5 starts)",
+            callback=self._hotstarters_callback,
+        )
+        self.tree.add_command(hotstarters_cmd)
+
+        coldstarters_cmd = app_commands.Command(
+            name="coldstarters",
+            description="Which probable starters for a date are trending cold (last 5 starts)",
+            callback=self._coldstarters_callback,
+        )
+        self.tree.add_command(coldstarters_cmd)
+
         try:
             synced = await self.tree.sync()
             log.info("Synced %d slash commands", len(synced))
@@ -233,7 +247,6 @@ class StartersBot(discord.Client):
                 continue
 
             last_pitch_line = "No prior start logged this season yet"
-            tag_str = ""
             try:
                 splits = mlb_api.get_pitcher_game_log(entry["pitcher_id"])
                 starts = [s for s in splits if s["is_start"]]
@@ -244,18 +257,55 @@ class StartersBot(discord.Client):
                     ).days - 1
                     rest_str = f", {rest_days} days rest" if rest_days >= 0 else ""
                     last_pitch_line = f"Threw {last['pitches']} pitches in his last start ({last['date']}{rest_str})"
-
-                    last5 = stats.summarize_outings(splits, 5)
-                    tag = stats.hot_cold_tag(last5)
-                    if tag and last5:
-                        tag_str = f" {tag} ({last5['era']} ERA last {last5['count']})"
             except Exception as e:
                 log.error("Game log lookup failed for %s: %s", entry["pitcher_name"], e)
 
-            lines.append(f"**{team['name']}**\n{entry['pitcher_name']} makes the start.{tag_str} {last_pitch_line}.\n")
+            lines.append(f"**{team['name']}**\n{entry['pitcher_name']} makes the start. {last_pitch_line}.\n")
 
         header = f"__**Probable Starters — {date_str}**__\n\n"
         await self._send_chunked(interaction, header, lines)
+
+    async def _hotstarters_callback(self, interaction: discord.Interaction, date: str | None = None):
+        await self._hot_or_cold(interaction, date, want_tag="🔥 Hot", label="Hot", emoji="🔥")
+
+    async def _coldstarters_callback(self, interaction: discord.Interaction, date: str | None = None):
+        await self._hot_or_cold(interaction, date, want_tag="🥶 Cold", label="Cold", emoji="🥶")
+
+    async def _hot_or_cold(self, interaction: discord.Interaction, date: str | None, want_tag: str, label: str, emoji: str):
+        await interaction.response.defer()
+        date_str = date or et_date_str(0)
+
+        try:
+            entries = mlb_api.get_probable_starters(date_str)
+        except Exception as e:
+            await interaction.followup.send(f"Couldn't reach the MLB API right now: {e}")
+            return
+
+        result_lines = []
+        for entry in entries:
+            if not entry["pitcher_id"]:
+                continue
+            try:
+                splits = mlb_api.get_pitcher_game_log(entry["pitcher_id"])
+            except Exception as e:
+                log.error("Game log lookup failed for %s: %s", entry["pitcher_name"], e)
+                continue
+
+            last5 = stats.summarize_outings(splits, 5)
+            tag = stats.hot_cold_tag(last5)
+            if tag != want_tag or not last5:
+                continue
+
+            result_lines.append(
+                f"**{entry['pitcher_name']}** ({entry['team_name']}) — "
+                f"{last5['era']} ERA, {last5['k9']} K/9 over last {last5['count']} starts\n"
+            )
+
+        header = f"__**{emoji} {label} Starters — {date_str}**__\n\n"
+        if not result_lines:
+            await interaction.followup.send(header + "None qualify today.")
+            return
+        await self._send_chunked(interaction, header, result_lines)
 
     async def _send_chunked(self, interaction: discord.Interaction, header: str, lines: list[str], limit: int = 1900):
         chunk = header
