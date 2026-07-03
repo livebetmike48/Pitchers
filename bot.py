@@ -233,16 +233,26 @@ class StartersBot(discord.Client):
                 continue
 
             last_pitch_line = "No prior start logged this season yet"
+            tag_str = ""
             try:
                 splits = mlb_api.get_pitcher_game_log(entry["pitcher_id"])
                 starts = [s for s in splits if s["is_start"]]
                 if starts:
                     last = starts[-1]
-                    last_pitch_line = f"Threw {last['pitches']} pitches in his last start ({last['date']})"
+                    rest_days = (
+                        datetime.strptime(date_str, "%Y-%m-%d") - datetime.strptime(last["date"], "%Y-%m-%d")
+                    ).days - 1
+                    rest_str = f", {rest_days} days rest" if rest_days >= 0 else ""
+                    last_pitch_line = f"Threw {last['pitches']} pitches in his last start ({last['date']}{rest_str})"
+
+                    last5 = stats.summarize_outings(splits, 5)
+                    tag = stats.hot_cold_tag(last5)
+                    if tag and last5:
+                        tag_str = f" {tag} ({last5['era']} ERA last {last5['count']})"
             except Exception as e:
                 log.error("Game log lookup failed for %s: %s", entry["pitcher_name"], e)
 
-            lines.append(f"**{team['name']}**\n{entry['pitcher_name']} makes the start. {last_pitch_line}.\n")
+            lines.append(f"**{team['name']}**\n{entry['pitcher_name']} makes the start.{tag_str} {last_pitch_line}.\n")
 
         header = f"__**Probable Starters — {date_str}**__\n\n"
         await self._send_chunked(interaction, header, lines)
