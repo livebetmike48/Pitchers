@@ -10,10 +10,12 @@ labeled honestly rather than pretending to be true percentile ranks.
 """
 from PIL import Image, ImageDraw, ImageFont
 import io
+import os
 import requests
 
 WIDTH, HEIGHT = 760, 660
 PHOTO_SIZE = 170
+LOGO_SIZE = 55
 BG_COLOR = (15, 20, 30)
 CARD_COLOR = (25, 32, 45)
 WHITE = (240, 240, 240)
@@ -52,6 +54,16 @@ def _fetch_headshot(player_id: int, size: int = PHOTO_SIZE) -> Image.Image | Non
         resp.raise_for_status()
         img = Image.open(io.BytesIO(resp.content)).convert("RGB")
         return img.resize((size, size))
+    except Exception:
+        return None
+
+
+def _load_logo() -> Image.Image | None:
+    """Loads the LiveBetMike logo badge. Returns None if the file isn't
+    present -- a missing logo should never break card generation."""
+    try:
+        path = os.path.join(os.path.dirname(__file__), "logo.png")
+        return Image.open(path).convert("RGB").resize((LOGO_SIZE, LOGO_SIZE))
     except Exception:
         return None
 
@@ -141,7 +153,16 @@ def build_pitcher_card(name: str, team: str, season: dict, tag: str | None,
         for i, s in enumerate(streaks[:3]):
             draw.text((30, streak_y + 35 + i * 26), s, font=font_small, fill=GREY)
 
-    draw.text((30, HEIGHT - 35), "Data: MLB Stats API (not Statcast percentiles)", font=font_small, fill=GREY)
+    logo = _load_logo()
+    footer_text_x = 30
+    if logo:
+        mask = Image.new("L", (LOGO_SIZE, LOGO_SIZE), 0)
+        ImageDraw.Draw(mask).rounded_rectangle((0, 0, LOGO_SIZE, LOGO_SIZE), radius=10, fill=255)
+        img.paste(logo, (30, HEIGHT - LOGO_SIZE - 15), mask)
+        footer_text_x = 30 + LOGO_SIZE + 12
+
+    draw.text((footer_text_x, HEIGHT - 48), "@LiveBetMike", font=font_label, fill=(80, 190, 235))
+    draw.text((footer_text_x, HEIGHT - 24), "Data: MLB Stats API (not Statcast percentiles)", font=font_small, fill=GREY)
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
