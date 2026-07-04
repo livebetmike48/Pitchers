@@ -154,7 +154,12 @@ class StartersBot(discord.Client):
         self.teams: list[dict] = []
 
     async def setup_hook(self):
-        storage.init_db()
+        try:
+            storage.init_db()
+        except Exception as e:
+            log.error("Failed to init database at %s: %s -- falling back to local storage", storage.DB_PATH, e)
+            storage.DB_PATH = "starters_bot_fallback.db"
+            storage.init_db()
         try:
             self.teams = mlb_api.get_all_teams()
         except Exception as e:
