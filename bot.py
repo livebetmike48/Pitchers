@@ -1,5 +1,6 @@
 import os
 import logging
+import io
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -9,6 +10,7 @@ from discord.ext import tasks
 import mlb_api
 import storage
 import stats
+import card
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -183,6 +185,14 @@ class StartersBot(discord.Client):
         self.tree.add_command(pitcher_cmd)
         pitcher_cmd.autocomplete("name")(self._name_autocomplete)
 
+        pitchercard_cmd = app_commands.Command(
+            name="pitchercard",
+            description="Visual stat card: ERA/K9/WHIP/BB9, W-L, hot/cold, streaks",
+            callback=self._pitchercard_callback,
+        )
+        self.tree.add_command(pitchercard_cmd)
+        pitchercard_cmd.autocomplete("name")(self._name_autocomplete)
+
         setchannel_cmd = app_commands.Command(
             name="setchannel",
             description="Set this channel to receive starter pitch count reports",
@@ -292,6 +302,41 @@ class StartersBot(discord.Client):
             await interaction.followup.send(f"Couldn't reach the MLB API right now: {e}")
             return
         await interaction.followup.send(embed=build_pitcher_embed(pitcher_name, splits))
+
+    async def _pitchercard_callback(self, interaction: discord.Interaction, name: str):
+        await interaction.response.defer()
+        person_id, pitcher_name = self._resolve_pitcher(name)
+        if person_id is None:
+            await interaction.followup.send(
+                f"Couldn't find a pitcher matching '{name}' on an active roster. "
+                f"Try selecting from the suggestions as you type."
+            )
+            return
+        try:
+            splits = mlb_api.get_pitcher_game_log(person_id)
+        except Exception as e:
+            await interaction.followup.send(f"Couldn't reach the MLB API right now: {e}")
+            return
+
+        if not splits:
+            await interaction.followup.send("No game log found for this pitcher this season yet.")
+            return
+
+        season = stats.summarize_outings(splits, len(splits))
+        last10 = stats.summarize_outings(splits, 10)
+        tag = stats.hot_cold_tag(last10)
+        pitcher_streaks = stats.get_pitcher_streaks(splits)
+        notable = stats.notable_pitcher_streak_labels(pitcher_streaks)
+
+        try:
+            png_bytes = card.build_pitcher_card(pitcher_name, "", season, tag, notable, player_id=person_id)
+        except Exception as e:
+            log.error("Card generation failed for %s: %s", pitcher_name, e)
+            await interaction.followup.send(f"Couldn't generate the card: {e}")
+            return
+
+        file = discord.File(io.BytesIO(png_bytes), filename=f"{pitcher_name.replace(' ', '_')}_card.png")
+        await interaction.followup.send(file=file)
 
     async def _setchannel_callback(self, interaction: discord.Interaction):
         storage.set_config("announce_channel_id", str(interaction.channel_id))
@@ -405,6 +450,8 @@ class StartersBot(discord.Client):
             poll_games.start(self)
         if not refresh_directory_loop.is_running():
             refresh_directory_loop.start(self)
+        if not watchdog.is_running():
+            watchdog.start()
 
 
 client = StartersBot()
@@ -412,39 +459,46 @@ client = StartersBot()
 
 @tasks.loop(minutes=POLL_MINUTES)
 async def poll_games(bot: StartersBot):
-    channel_id = storage.get_config("announce_channel_id")
-    if not channel_id:
-        return
-    channel = bot.get_channel(int(channel_id))
-    if channel is None:
-        return
+    try:
+        channel_id = storage.get_config("announce_channel_id")
+        if not channel_id:
+            return
+        channel = bot.get_channel(int(channel_id))
+        if channel is None:
+            return
 
-    for offset in (0, -1):
-        date_str = et_date_str(offset)
-        try:
-            games = mlb_api.get_live_games(date_str)
-        except Exception as e:
-            log.error("Failed to fetch schedule for %s: %s", date_str, e)
-            continue
-
-        for g in games:
-            if g["abstract_state"] != "Final":
-                continue
-            if storage.is_game_posted(g["game_pk"]):
-                continue
+        for offset in (0, -1):
+            date_str = et_date_str(offset)
             try:
-                box = mlb_api.get_boxscore(g["game_pk"])
-                starters = mlb_api.extract_starters(box)
+                games = mlb_api.get_live_games(date_str)
             except Exception as e:
-                log.error("Failed to fetch/parse boxscore for game %s: %s", g["game_pk"], e)
+                log.error("Failed to fetch schedule for %s: %s", date_str, e)
                 continue
 
-            storage.mark_game_posted(g["game_pk"])
-            try:
-                await channel.send(embed=build_game_embed(g, starters))
-                log.info("Posted starter report for game %s", g["game_pk"])
-            except Exception as e:
-                log.error("Failed to send starter report for game %s: %s", g["game_pk"], e)
+            for g in games:
+                if g["abstract_state"] != "Final":
+                    continue
+                if storage.is_game_posted(g["game_pk"]):
+                    continue
+                try:
+                    box = mlb_api.get_boxscore(g["game_pk"])
+                    starters = mlb_api.extract_starters(box)
+                except Exception as e:
+                    log.error("Failed to fetch/parse boxscore for game %s: %s", g["game_pk"], e)
+                    continue
+
+                storage.mark_game_posted(g["game_pk"])
+                try:
+                    await channel.send(embed=build_game_embed(g, starters))
+                    log.info("Posted starter report for game %s", g["game_pk"])
+                except Exception as e:
+                    log.error("Failed to send starter report for game %s: %s", g["game_pk"], e)
+    except Exception as e:
+        # Top-level safety net: discord.py's task loop permanently stops on
+        # any unhandled exception with no automatic restart. This guarantees
+        # that can never happen here -- worst case, this one cycle is
+        # skipped and logged, but the loop itself keeps running forever.
+        log.error("poll_games cycle failed unexpectedly, will retry next cycle: %s", e)
 
 
 @poll_games.before_loop
@@ -454,11 +508,36 @@ async def before_poll():
 
 @tasks.loop(hours=ROSTER_REFRESH_HOURS)
 async def refresh_directory_loop(bot: StartersBot):
-    await bot.refresh_player_directory()
+    try:
+        await bot.refresh_player_directory()
+    except Exception as e:
+        log.error("refresh_directory_loop cycle failed unexpectedly, will retry next cycle: %s", e)
 
 
 @refresh_directory_loop.before_loop
 async def before_refresh():
+    await client.wait_until_ready()
+
+
+@tasks.loop(minutes=2)
+async def watchdog():
+    """
+    Belt-and-suspenders: if either background loop somehow stops for any
+    reason not already caught above, this notices within 2 minutes and
+    restarts it -- rather than the bot going silently dark for the rest
+    of the day with no automatic recovery, which is what happened before
+    this was added.
+    """
+    if not poll_games.is_running():
+        log.error("poll_games was found stopped -- restarting it now")
+        poll_games.start(client)
+    if not refresh_directory_loop.is_running():
+        log.error("refresh_directory_loop was found stopped -- restarting it now")
+        refresh_directory_loop.start(client)
+
+
+@watchdog.before_loop
+async def before_watchdog():
     await client.wait_until_ready()
 
 
