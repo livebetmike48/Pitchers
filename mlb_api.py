@@ -135,6 +135,7 @@ def get_pitcher_game_log(person_id: int, season: int = CURRENT_SEASON) -> list[d
                 "er": stat.get("earnedRuns", 0),
                 "bb": stat.get("baseOnBalls", 0),
                 "so": stat.get("strikeOuts", 0),
+                "bf": stat.get("battersFaced", 0),
                 "is_start": bool(stat.get("gamesStarted")),
                 "decision": stat.get("decision") or stat.get("note"),
             })
