@@ -1,7 +1,8 @@
 import sqlite3
+import os
 from contextlib import contextmanager
 
-DB_PATH = "starters_bot.db"
+DB_PATH = os.getenv("DB_PATH", "starters_bot.db")
 
 
 @contextmanager
