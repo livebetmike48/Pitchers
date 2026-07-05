@@ -213,8 +213,15 @@ class StartersBot(discord.Client):
         self.tree.add_command(coldstarters_cmd)
 
         try:
-            synced = await self.tree.sync()
-            log.info("Synced %d slash commands", len(synced))
+            guild_id = os.getenv("GUILD_ID")
+            if guild_id:
+                guild = discord.Object(id=int(guild_id))
+                self.tree.copy_global_to(guild=guild)
+                synced = await self.tree.sync(guild=guild)
+                log.info("Synced %d slash commands to guild %s (fast, avoids global rate limits)", len(synced), guild_id)
+            else:
+                synced = await self.tree.sync()
+                log.info("Synced %d slash commands globally (set GUILD_ID env var for faster, safer syncing)", len(synced))
         except Exception as e:
             log.error("Slash command sync failed: %s", e)
 
