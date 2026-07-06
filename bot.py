@@ -523,11 +523,11 @@ async def before_watchdog():
     await client.wait_until_ready()
 
 
-# 10 PM ET the night before, and 11 AM ET the day of -- approximated as
+# 11 PM ET the night before, and 11 AM ET the day of -- approximated as
 # UTC-4 (matches the rest of this bot's ET handling; will drift by an hour
 # during EST in the off-season, same known limitation as elsewhere here).
-# 10 PM ET = 02:00 UTC (next day). 11 AM ET = 15:00 UTC.
-SCHEDULED_TIMES = [dtime(hour=2, minute=0), dtime(hour=15, minute=0)]
+# 11 PM ET = 03:00 UTC (next day). 11 AM ET = 15:00 UTC.
+SCHEDULED_TIMES = [dtime(hour=3, minute=0), dtime(hour=15, minute=0)]
 
 
 @tasks.loop(time=SCHEDULED_TIMES)
