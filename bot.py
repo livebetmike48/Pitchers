@@ -526,11 +526,8 @@ async def before_watchdog():
 # 11 PM ET the night before, and 11 AM ET the day of -- approximated as
 # UTC-4 (matches the rest of this bot's ET handling; will drift by an hour
 # during EST in the off-season, same known limitation as elsewhere here).
-# 11 AM ET = 15:00 UTC. The 11 PM tomorrow's-slate post RETIRED Aug 2026 --
-# the threads bot owns the nightly post now (full thread draft at 11:05).
-# This bot keeps only the day-of 11 AM post: today's starters with rest
-# schedules.
-SCHEDULED_TIMES = [dtime(hour=15, minute=0)]
+# 11 PM ET = 03:00 UTC (next day). 11 AM ET = 15:00 UTC.
+SCHEDULED_TIMES = [dtime(hour=3, minute=0), dtime(hour=15, minute=0)]
 
 
 @tasks.loop(time=SCHEDULED_TIMES)
@@ -543,11 +540,15 @@ async def scheduled_starters_post(bot: StartersBot):
         if channel is None:
             return
 
-        # Single scheduled run: 15:00 UTC (11 AM ET) -- today's slate with
-        # rest schedules. (The nightly tomorrow's-slate post lives in the
-        # threads bot now.)
-        date_str = et_date_str(0)
-        label = "Today's"
+        now_utc = datetime.now(timezone.utc)
+        if now_utc.hour < 6:
+            # This is the 02:00 UTC run (10 PM ET the night before) -- post TOMORROW's slate
+            date_str = et_date_str(1)
+            label = "Tomorrow's"
+        else:
+            # This is the 15:00 UTC run (11 AM ET day-of) -- post TODAY's slate
+            date_str = et_date_str(0)
+            label = "Today's"
 
         try:
             lines = await asyncio.to_thread(bot._build_starters_lines_sync, date_str)
