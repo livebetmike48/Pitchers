@@ -225,7 +225,7 @@ class StartersBot(discord.Client):
 
         laststart_cmd = app_commands.Command(
             name="laststart",
-            description="Diagnostic: most recent start at ANY level (MLB/AAA/AA/A/Rookie)",
+            description="His last start, wherever it was — MLB or the minors",
             callback=self._laststart_callback,
         )
         self.tree.add_command(laststart_cmd)
@@ -442,7 +442,6 @@ class StartersBot(discord.Client):
 
         today = et_date_str(0)
         try:
-            per_level = await asyncio.to_thread(self._laststart_probe_sync, person_id)
             last = await asyncio.to_thread(
                 mlb_api.last_start_any_level, person_id, today
             )
@@ -450,36 +449,34 @@ class StartersBot(discord.Client):
             await interaction.followup.send(f"Lookup failed: {e}")
             return
 
+        if not last:
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title=resolved,
+                    description="No start found at any level this season.",
+                    color=discord.Color.light_grey(),
+                )
+            )
+            return
+
         embed = discord.Embed(
-            title=f"{resolved} — last start, any level",
-            description=format_last_start(last, today) + "." if last
-            else "No start found at any level this season.",
-            color=discord.Color.blue() if last else discord.Color.light_grey(),
+            title=f"{resolved} — last start",
+            description=format_last_start(last, today) + ".",
+            color=discord.Color.blue(),
         )
-        rows = []
-        for sid, label, n_starts, latest in per_level:
-            if n_starts:
-                word = "start" if n_starts == 1 else "starts"
-                rows.append(f"**{label}** (sportId {sid}): {n_starts} {word}, latest {latest}")
-            else:
-                rows.append(f"{label} (sportId {sid}): —")
-        embed.add_field(name="What each level returned", value="\n".join(rows), inline=False)
+        embed.add_field(
+            name="Line",
+            value=(
+                f"{last.get('ip', '0.0')} IP, {last.get('hits', 0)}H "
+                f"{last.get('er', 0)}ER {last.get('bb', 0)}BB {last.get('so', 0)}K"
+                + (f" vs {last['opponent']}" if last.get("opponent") else "")
+            ),
+            inline=False,
+        )
         if note:
             embed.add_field(name="Name match", value=note, inline=False)
         embed.set_footer(text="Data: MLB Stats API (same feed as mlb.com / milb.com)")
         await interaction.followup.send(embed=embed)
-
-    def _laststart_probe_sync(self, person_id: int):
-        out = []
-        for sid, label in mlb_api.LEVELS.items():
-            try:
-                rows = mlb_api.get_pitcher_game_log(person_id, sport_id=sid)
-            except Exception:
-                out.append((sid, label, 0, "lookup failed"))
-                continue
-            starts = [r for r in rows if r.get("is_start")]
-            out.append((sid, label, len(starts), starts[-1]["date"] if starts else "—"))
-        return out
 
     async def _setchannel_callback(self, interaction: discord.Interaction):
         storage.set_config("announce_channel_id", str(interaction.channel_id))
