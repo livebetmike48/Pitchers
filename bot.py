@@ -281,16 +281,24 @@ class StartersBot(discord.Client):
             log.error("Failed to fetch teams for directory: %s", e)
             return
         directory = []
+        seen: set[int] = set()
+        # "active" alone hides anyone on the IL -- which is exactly who we need
+        # when a guy is making a rehab start. 40Man carries IL players, so we
+        # merge both and de-dupe.
         for team in teams:
-            try:
-                pitchers = mlb_api.get_active_roster_pitchers(team["id"])
-            except Exception as e:
-                log.error("Failed to fetch roster for team %s: %s", team["id"], e)
-                continue
-            for p in pitchers:
-                directory.append({"id": p["id"], "name": p["name"], "team": team["abbreviation"]})
+            for roster_type in ("active", "40Man"):
+                try:
+                    pitchers = mlb_api.get_roster_pitchers(team["id"], roster_type)
+                except Exception as e:
+                    log.error("Failed to fetch %s roster for team %s: %s", roster_type, team["id"], e)
+                    continue
+                for p in pitchers:
+                    if p["id"] in seen:
+                        continue
+                    seen.add(p["id"])
+                    directory.append({"id": p["id"], "name": p["name"], "team": team["abbreviation"]})
         self.player_directory = directory
-        log.info("Player directory refreshed: %d pitchers", len(directory))
+        log.info("Player directory refreshed: %d pitchers (active + 40-man)", len(directory))
 
     async def _name_autocomplete(self, interaction: discord.Interaction, current: str):
         current_lower = current.lower()
@@ -318,13 +326,41 @@ class StartersBot(discord.Client):
                 pitcher_name = match["name"]
         return person_id, pitcher_name
 
+    def _resolve_pitcher_deep(self, name: str):
+        """
+        Directory first, then the cross-level player index.
+
+        The directory is built from MLB rosters, so it misses pure minor
+        leaguers entirely. The index covers MLB + Triple-A + Double-A, which
+        is what makes a rehabbing or not-yet-called-up arm findable at all.
+        Returns (person_id, display_name, note) -- note is a short string
+        explaining an unusual match, or None.
+        """
+        person_id, pitcher_name = self._resolve_pitcher(name)
+        if person_id is not None:
+            return person_id, pitcher_name, None
+        if name.isdigit():
+            return int(name), name, None
+
+        matches = mlb_api.find_pitchers(name)
+        if not matches:
+            return None, name, None
+        best = matches[0]
+        note = None
+        if best["level"] != "MLB":
+            note = f"Not on an MLB roster — found in {best['level']}."
+        if len(matches) > 1:
+            others = ", ".join(f"{m['name']} ({m['level']})" for m in matches[1:4])
+            note = (note or "") + f" Other matches: {others}."
+        return best["id"], best["name"], note
+
     async def _pitchcount_callback(self, interaction: discord.Interaction, name: str):
         await interaction.response.defer()
-        person_id, pitcher_name = self._resolve_pitcher(name)
+        person_id, pitcher_name, _note = await asyncio.to_thread(self._resolve_pitcher_deep, name)
         if person_id is None:
             await interaction.followup.send(
-                f"Couldn't find a pitcher matching '{name}' on an active roster. "
-                f"Try selecting from the suggestions as you type."
+                f"Couldn't find a pitcher matching '{name}'. Try selecting from the "
+                f"suggestions as you type."
             )
             return
         try:
@@ -336,11 +372,11 @@ class StartersBot(discord.Client):
 
     async def _pitcher_callback(self, interaction: discord.Interaction, name: str):
         await interaction.response.defer()
-        person_id, pitcher_name = self._resolve_pitcher(name)
+        person_id, pitcher_name, _note = await asyncio.to_thread(self._resolve_pitcher_deep, name)
         if person_id is None:
             await interaction.followup.send(
-                f"Couldn't find a pitcher matching '{name}' on an active roster. "
-                f"Try selecting from the suggestions as you type."
+                f"Couldn't find a pitcher matching '{name}'. Try selecting from the "
+                f"suggestions as you type."
             )
             return
         try:
@@ -357,9 +393,12 @@ class StartersBot(discord.Client):
         wrong inside the automated starters post.
         """
         await interaction.response.defer()
-        person_id, resolved = self._resolve_pitcher(name)
+        person_id, resolved, note = await asyncio.to_thread(self._resolve_pitcher_deep, name)
         if not person_id:
-            await interaction.followup.send(f"Couldn't find a pitcher named '{name}'.")
+            await interaction.followup.send(
+                f"Couldn't find a pitcher named '{name}' on an MLB roster or in the "
+                f"Triple-A / Double-A player index."
+            )
             return
 
         today = et_date_str(0)
@@ -381,10 +420,13 @@ class StartersBot(discord.Client):
         rows = []
         for sid, label, n_starts, latest in per_level:
             if n_starts:
-                rows.append(f"**{label}** (sportId {sid}): {n_starts} starts, latest {latest}")
+                word = "start" if n_starts == 1 else "starts"
+                rows.append(f"**{label}** (sportId {sid}): {n_starts} {word}, latest {latest}")
             else:
                 rows.append(f"{label} (sportId {sid}): —")
         embed.add_field(name="What each level returned", value="\n".join(rows), inline=False)
+        if note:
+            embed.add_field(name="Name match", value=note, inline=False)
         embed.set_footer(text="Data: MLB Stats API (same feed as mlb.com / milb.com)")
         await interaction.followup.send(embed=embed)
 
