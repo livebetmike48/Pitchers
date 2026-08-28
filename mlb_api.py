@@ -1,746 +1,358 @@
+"""
+Thin client for the free public MLB Stats API. No key required.
+"""
 import os
-import logging
-import asyncio
-from datetime import datetime, timedelta, timezone, time as dtime
 
-import discord
-from discord import app_commands
-from discord.ext import tasks
+import requests
 
-import mlb_api
-import storage
-import stats
-
-from dotenv import load_dotenv
-load_dotenv()
-
-TOKEN = os.getenv("DISCORD_TOKEN")
-POLL_MINUTES = float(os.getenv("POLL_MINUTES", "5"))
-ROSTER_REFRESH_HOURS = float(os.getenv("ROSTER_REFRESH_HOURS", "6"))
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("starters_bot")
-
-intents = discord.Intents.default()
+BASE = "https://statsapi.mlb.com/api/v1"
+CURRENT_SEASON = 2026
 
 
-def et_date_str(offset_days: int = 0) -> str:
-    et = datetime.now(timezone.utc) - timedelta(hours=4)
-    et += timedelta(days=offset_days)
-    return et.strftime("%Y-%m-%d")
+def get_all_teams() -> list[dict]:
+    resp = requests.get(f"{BASE}/teams", params={"sportId": 1}, timeout=15)
+    resp.raise_for_status()
+    return [
+        {"id": t["id"], "name": t["name"], "abbreviation": t["abbreviation"]}
+        for t in resp.json().get("teams", [])
+    ]
 
 
-
-def format_last_start(last: dict, as_of: str) -> str:
+def get_probable_starters(date_str: str) -> list[dict]:
     """
-    One line describing a pitcher's most recent start, wherever it happened.
-
-    MLB starts read exactly as they always have -- the level phrase is added
-    only when the start was somewhere other than the big leagues:
-
-        Threw 81 pitches in his last start (2026-08-16, 5 days rest)
-        Threw 81 pitches in his last start in Triple-A (2026-08-16, 5 days rest)
-
-    Days of rest stays on every line on purpose: it is what makes a stale
-    reading visible instead of silent.
+    One entry per team per game on this date, with their probable starter
+    if MLB has announced one yet (None if TBD).
     """
-    rest_days = (
-        datetime.strptime(as_of, "%Y-%m-%d") - datetime.strptime(last["date"], "%Y-%m-%d")
-    ).days - 1
-    rest_str = f", {rest_days} days rest" if rest_days >= 0 else ""
-
-    level = last.get("level", "MLB")
-    where = "" if level == "MLB" else f" in {level}"
-
-    pitches = last.get("pitches")
-    if not pitches:
-        # Never invent a pitch count. Some minor league lines omit it.
-        return (
-            f"Last start{where} was {last['date']}{rest_str} "
-            f"({last.get('ip', '0.0')} IP, pitch count not reported)"
-        )
-    return f"Threw {pitches} pitches in his last start{where} ({last['date']}{rest_str})"
-
-
-def build_game_embed(game: dict, starters: dict) -> discord.Embed:
-    away, home = starters["away"], starters["home"]
-    embed = discord.Embed(
-        title=f"{away['team']} @ {home['team']} — Starter Pitch Counts",
-        color=discord.Color.blue(),
+    resp = requests.get(
+        f"{BASE}/schedule",
+        params={"sportId": 1, "date": date_str, "hydrate": "probablePitcher"},
+        timeout=15,
     )
-    for side in (away, home):
-        s = side["starter"]
-        if s:
-            value = (
-                f"**{s['name']}**\n{s['pitches']} pitches, {s['ip']} IP, "
-                f"{s['hits']}H {s['er']}ER {s['bb']}BB {s['so']}K"
-            )
-        else:
-            value = "No starter data"
-        embed.add_field(name=side["team"], value=value, inline=False)
-    embed.set_footer(text="Data: MLB Stats API")
-    return embed
-
-
-def build_pitchcount_embed(pitcher_name: str, splits: list[dict]) -> discord.Embed:
-    """Strictly pitch-count focused: last outing + recent pitch counts, nothing else."""
-    if not splits:
-        return discord.Embed(
-            title=pitcher_name,
-            description="No game log found for this season yet.",
-            color=discord.Color.light_grey(),
-        )
-    last = splits[-1]
-    tag_text = "Start" if last["is_start"] else "Relief appearance"
-
-    embed = discord.Embed(
-        title=f"{pitcher_name} — Pitch Count",
-        description=(
-            f"{last['date']} vs {last['opponent']} ({tag_text})\n\n"
-            f"**{last['pitches']} pitches** • {last['ip']} IP"
-        ),
-        color=discord.Color.blue(),
-    )
-
-    if len(splits) >= 2:
-        recent = splits[-10:][::-1]
-        lines = [f"{s['date']}: **{s['pitches']}p**, {s['ip']} IP" for s in recent]
-        embed.add_field(name="Recent pitch counts", value="\n".join(lines), inline=False)
-
-    avg10 = stats.summarize_outings(splits, 10)
-    if avg10:
-        embed.add_field(
-            name="Average (last 10 starts)",
-            value=f"{avg10['avg_pitches']} pitches/start",
-            inline=False,
-        )
-
-    embed.set_footer(text="Data: MLB Stats API")
-    return embed
-
-
-def build_pitcher_embed(pitcher_name: str, splits: list[dict]) -> discord.Embed:
-    """Full breakdown: streaks, rolling windows, ERA/K9/WHIP/BF -- mirrors /batter."""
-    if not splits:
-        return discord.Embed(
-            title=pitcher_name,
-            description="No game log found for this season yet.",
-            color=discord.Color.light_grey(),
-        )
-    last = splits[-1]
-    tag_text = "Start" if last["is_start"] else "Relief appearance"
-
-    last10 = stats.summarize_outings(splits, 10)
-    hot_cold = stats.hot_cold_tag(last10)
-
-    title = f"{pitcher_name} — Last Outing"
-    if hot_cold:
-        title = f"{title}  {hot_cold}"
-
-    embed = discord.Embed(
-        title=title,
-        description=(
-            f"{last['date']} vs {last['opponent']} ({tag_text})\n\n"
-            f"**{last['pitches']} pitches** • {last['ip']} IP\n"
-            f"{last['hits']}H {last['er']}ER {last['bb']}BB {last['so']}K • {last.get('bf', 0)} BF"
-        ),
-        color=discord.Color.blue(),
-    )
-
-    pitcher_streaks = stats.get_pitcher_streaks(splits)
-    notable = stats.notable_pitcher_streak_labels(pitcher_streaks)
-    if notable:
-        embed.add_field(name="Active streaks", value="\n".join(notable), inline=False)
-
-    def window_field(summary: dict | None, label: str):
-        if not summary:
-            return
-        embed.add_field(
-            name=label,
-            value=(
-                f"ERA: **{summary['era']}** • K/9: **{summary['k9']}** • WHIP: {summary['whip']}\n"
-                f"{summary['total_ip']} IP, {summary['total_bf']} BF over {summary['count']} starts "
-                f"(avg {summary['avg_pitches']} pitches)"
-            ),
-            inline=False,
-        )
-
-    window_field(stats.summarize_outings(splits, 5), "Last 5 Starts")
-    window_field(stats.summarize_outings(splits, 10), "Last 10 Starts")
-    window_field(stats.summarize_outings(splits, 20), "Last 20 Starts")
-    window_field(stats.summarize_outings(splits, len(splits)), "Season")
-
-    if len(splits) >= 2:
-        recent = splits[-5:][::-1]
-        lines = [f"{s['date']}: {s['pitches']}p, {s['ip']} IP" for s in recent]
-        embed.add_field(name="Recent outings", value="\n".join(lines), inline=False)
-
-    embed.set_footer(text="Data: MLB Stats API • Hot/Cold tags need 3+ starts in the window")
-    return embed
-
-
-class StartersBot(discord.Client):
-    def __init__(self):
-        super().__init__(intents=intents)
-        self.tree = app_commands.CommandTree(self)
-        self.player_directory: list[dict] = []  # [{"id":, "name":, "team":}]
-        self.teams: list[dict] = []
-
-    async def setup_hook(self):
-        try:
-            storage.init_db()
-        except Exception as e:
-            log.error("Failed to init database at %s: %s -- falling back to local storage", storage.DB_PATH, e)
-            storage.DB_PATH = "starters_bot_fallback.db"
-            storage.init_db()
-        try:
-            self.teams = mlb_api.get_all_teams()
-        except Exception as e:
-            log.error("Failed to fetch team list at startup: %s", e)
-            self.teams = []
-        await self.refresh_player_directory()
-
-        pitchcount_cmd = app_commands.Command(
-            name="pitchcount",
-            description="Just the pitch counts: last outing + recent starts, nothing else",
-            callback=self._pitchcount_callback,
-        )
-        self.tree.add_command(pitchcount_cmd)
-        pitchcount_cmd.autocomplete("name")(self._name_autocomplete)
-
-        pitcher_cmd = app_commands.Command(
-            name="pitcher",
-            description="Full breakdown: streaks, Last 5/10/20/Season, ERA/K9/WHIP/BF",
-            callback=self._pitcher_callback,
-        )
-        self.tree.add_command(pitcher_cmd)
-        pitcher_cmd.autocomplete("name")(self._name_autocomplete)
-
-        setchannel_cmd = app_commands.Command(
-            name="setchannel",
-            description="Set this channel to receive starter pitch count reports",
-            callback=self._setchannel_callback,
-        )
-        self.tree.add_command(setchannel_cmd)
-
-        laststart_cmd = app_commands.Command(
-            name="laststart",
-            description="Diagnostic: most recent start at ANY level (MLB/AAA/AA/A/Rookie)",
-            callback=self._laststart_callback,
-        )
-        self.tree.add_command(laststart_cmd)
-        laststart_cmd.autocomplete("name")(self._name_autocomplete)
-
-        starters_cmd = app_commands.Command(
-            name="starters",
-            description="Probable starters for a date (YYYY-MM-DD, blank = today), with last pitch count",
-            callback=self._starters_callback,
-        )
-        self.tree.add_command(starters_cmd)
-
-        hotstarters_cmd = app_commands.Command(
-            name="hotstarters",
-            description="Which probable starters for a date are trending hot (last 5 starts)",
-            callback=self._hotstarters_callback,
-        )
-        self.tree.add_command(hotstarters_cmd)
-
-        coldstarters_cmd = app_commands.Command(
-            name="coldstarters",
-            description="Which probable starters for a date are trending cold (last 5 starts)",
-            callback=self._coldstarters_callback,
-        )
-        self.tree.add_command(coldstarters_cmd)
-
-        try:
-            guild_id = os.getenv("GUILD_ID")
-            if guild_id:
-                guild = discord.Object(id=int(guild_id))
-                self.tree.copy_global_to(guild=guild)
-                synced = await self.tree.sync(guild=guild)
-                log.info("Synced %d slash commands to guild %s (fast, avoids global rate limits)", len(synced), guild_id)
-
-                # One-time cleanup: earlier deploys registered these commands
-                # GLOBALLY. Switching to guild-sync doesn't remove those old
-                # global copies on Discord's side, so both were showing up
-                # side by side -- explicitly wiping the global registration
-                # here fixes the duplicate-command symptom for good.
-                self.tree.clear_commands(guild=None)
-                await self.tree.sync()
-                log.info("Cleared stale global command registration (one-time cleanup)")
-            else:
-                synced = await self.tree.sync()
-                log.info("Synced %d slash commands globally (set GUILD_ID env var for faster, safer syncing)", len(synced))
-        except Exception as e:
-            log.error("Slash command sync failed: %s", e)
-
-    async def refresh_player_directory(self):
-        try:
-            teams = mlb_api.get_all_teams()
-        except Exception as e:
-            log.error("Failed to fetch teams for directory: %s", e)
-            return
-        directory = []
-        seen: set[int] = set()
-        # "active" alone hides anyone on the IL -- which is exactly who we need
-        # when a guy is making a rehab start. 40Man carries IL players, so we
-        # merge both and de-dupe.
-        for team in teams:
-            for roster_type in ("active", "40Man"):
-                try:
-                    pitchers = mlb_api.get_roster_pitchers(team["id"], roster_type)
-                except Exception as e:
-                    log.error("Failed to fetch %s roster for team %s: %s", roster_type, team["id"], e)
-                    continue
-                for p in pitchers:
-                    if p["id"] in seen:
-                        continue
-                    seen.add(p["id"])
-                    directory.append({"id": p["id"], "name": p["name"], "team": team["abbreviation"]})
-        self.player_directory = directory
-        log.info("Player directory refreshed: %d pitchers (active + 40-man)", len(directory))
-
-        # Warm the cross-level index here, on the slow path, so autocomplete
-        # can search MLB + Triple-A + Double-A without ever making a network
-        # call inside Discord's ~3 second autocomplete budget.
-        try:
-            n = await asyncio.to_thread(mlb_api.warm_player_index)
-            log.info("Player index warmed: %d players across MLB/AAA/AA", n)
-        except Exception as e:
-            log.error("Player index warm failed (autocomplete falls back to rosters): %s", e)
-
-    async def _name_autocomplete(self, interaction: discord.Interaction, current: str):
-        """
-        Suggestions come from the MLB roster directory FIRST, then from the
-        cross-level player index (Triple-A / Double-A). Without the second
-        source a rehabbing or not-yet-called-up pitcher never appears in the
-        dropdown, so there is no way to reach him at all -- the whole point
-        of the minor league lookup.
-
-        Never fetches: allow_fetch=False means a cold cache just yields the
-        roster names rather than blowing Discord's autocomplete timeout.
-        """
-        current_lower = (current or "").lower()
-        choices: list[app_commands.Choice] = []
-        seen: set[int] = set()
-
-        for p in self.player_directory:
-            if current_lower in p["name"].lower():
-                seen.add(p["id"])
-                choices.append(
-                    app_commands.Choice(name=f"{p['name']} ({p['team']})", value=str(p["id"]))
-                )
-                if len(choices) >= 25:
-                    return choices
-
-        if current_lower:
-            try:
-                extra = mlb_api.find_pitchers(current_lower, allow_fetch=False)
-            except Exception:
-                extra = []
-            for p in extra:
-                if p["id"] in seen:
-                    continue
-                seen.add(p["id"])
-                label = f"{p['name']} ({p['level']})"
-                choices.append(app_commands.Choice(name=label[:100], value=str(p["id"])))
-                if len(choices) >= 25:
-                    break
-        return choices
-
-    def _resolve_pitcher(self, name: str):
-        """`name` is the person_id if picked from autocomplete; falls back to a
-        substring name search if the person typed free text and hit enter."""
-        person_id = None
-        pitcher_name = name
-        if name.isdigit():
-            person_id = int(name)
-            match = next((p for p in self.player_directory if p["id"] == person_id), None)
-            if match:
-                pitcher_name = match["name"]
-        else:
-            match = next((p for p in self.player_directory if name.lower() in p["name"].lower()), None)
-            if match:
-                person_id = match["id"]
-                pitcher_name = match["name"]
-        return person_id, pitcher_name
-
-    def _resolve_pitcher_deep(self, name: str):
-        """
-        Directory first, then the cross-level player index.
-
-        The directory is built from MLB rosters, so it misses pure minor
-        leaguers entirely. The index covers MLB + Triple-A + Double-A, which
-        is what makes a rehabbing or not-yet-called-up arm findable at all.
-        Returns (person_id, display_name, note) -- note is a short string
-        explaining an unusual match, or None.
-        """
-        person_id, pitcher_name = self._resolve_pitcher(name)
-        if person_id is not None:
-            return person_id, pitcher_name, None
-        if name.isdigit():
-            return int(name), name, None
-
-        matches = mlb_api.find_pitchers(name)
-        if not matches:
-            return None, name, None
-        best = matches[0]
-        note = None
-        if best["level"] != "MLB":
-            note = f"Not on an MLB roster — found in {best['level']}."
-        if len(matches) > 1:
-            others = ", ".join(f"{m['name']} ({m['level']})" for m in matches[1:4])
-            note = (note or "") + f" Other matches: {others}."
-        return best["id"], best["name"], note
-
-    async def _pitchcount_callback(self, interaction: discord.Interaction, name: str):
-        await interaction.response.defer()
-        person_id, pitcher_name, _note = await asyncio.to_thread(self._resolve_pitcher_deep, name)
-        if person_id is None:
-            await interaction.followup.send(
-                f"Couldn't find a pitcher matching '{name}'. Try selecting from the "
-                f"suggestions as you type."
-            )
-            return
-        try:
-            splits = mlb_api.get_pitcher_game_log(person_id)
-        except Exception as e:
-            await interaction.followup.send(f"Couldn't reach the MLB API right now: {e}")
-            return
-        await interaction.followup.send(embed=build_pitchcount_embed(pitcher_name, splits))
-
-    async def _pitcher_callback(self, interaction: discord.Interaction, name: str):
-        await interaction.response.defer()
-        person_id, pitcher_name, _note = await asyncio.to_thread(self._resolve_pitcher_deep, name)
-        if person_id is None:
-            await interaction.followup.send(
-                f"Couldn't find a pitcher matching '{name}'. Try selecting from the "
-                f"suggestions as you type."
-            )
-            return
-        try:
-            splits = mlb_api.get_pitcher_game_log(person_id)
-        except Exception as e:
-            await interaction.followup.send(f"Couldn't reach the MLB API right now: {e}")
-            return
-        await interaction.followup.send(embed=build_pitcher_embed(pitcher_name, splits))
-
-    async def _laststart_callback(self, interaction: discord.Interaction, name: str):
-        """
-        Verification surface. Shows, per level, what the API actually returned
-        and which start won -- so a wrong answer is visible instead of quietly
-        wrong inside the automated starters post.
-        """
-        await interaction.response.defer()
-        person_id, resolved, note = await asyncio.to_thread(self._resolve_pitcher_deep, name)
-        if not person_id:
-            await interaction.followup.send(
-                f"Couldn't find a pitcher named '{name}' on an MLB roster or in the "
-                f"Triple-A / Double-A player index."
-            )
-            return
-
-        today = et_date_str(0)
-        try:
-            per_level = await asyncio.to_thread(self._laststart_probe_sync, person_id)
-            last = await asyncio.to_thread(
-                mlb_api.last_start_any_level, person_id, today
-            )
-        except Exception as e:
-            await interaction.followup.send(f"Lookup failed: {e}")
-            return
-
-        embed = discord.Embed(
-            title=f"{resolved} — last start, any level",
-            description=format_last_start(last, today) + "." if last
-            else "No start found at any level this season.",
-            color=discord.Color.blue() if last else discord.Color.light_grey(),
-        )
-        rows = []
-        for sid, label, n_starts, latest in per_level:
-            if n_starts:
-                word = "start" if n_starts == 1 else "starts"
-                rows.append(f"**{label}** (sportId {sid}): {n_starts} {word}, latest {latest}")
-            else:
-                rows.append(f"{label} (sportId {sid}): —")
-        embed.add_field(name="What each level returned", value="\n".join(rows), inline=False)
-        if note:
-            embed.add_field(name="Name match", value=note, inline=False)
-        embed.set_footer(text="Data: MLB Stats API (same feed as mlb.com / milb.com)")
-        await interaction.followup.send(embed=embed)
-
-    def _laststart_probe_sync(self, person_id: int):
-        out = []
-        for sid, label in mlb_api.LEVELS.items():
-            try:
-                rows = mlb_api.get_pitcher_game_log(person_id, sport_id=sid)
-            except Exception:
-                out.append((sid, label, 0, "lookup failed"))
-                continue
-            starts = [r for r in rows if r.get("is_start")]
-            out.append((sid, label, len(starts), starts[-1]["date"] if starts else "—"))
-        return out
-
-    async def _setchannel_callback(self, interaction: discord.Interaction):
-        storage.set_config("announce_channel_id", str(interaction.channel_id))
-        await interaction.response.send_message(
-            f"✅ Starter pitch count reports will post in {interaction.channel.mention}."
-        )
-
-    async def _starters_callback(self, interaction: discord.Interaction, date: str | None = None):
-        await interaction.response.defer()
-        date_str = date or et_date_str(0)
-
-        try:
-            lines = await asyncio.to_thread(self._build_starters_lines_sync, date_str)
-        except Exception as e:
-            await interaction.followup.send(f"Couldn't reach the MLB API right now: {e}")
-            return
-
-        header = f"__**Probable Starters — {date_str}**__\n\n"
-        await self._send_chunked(interaction, header, lines)
-
-    def _build_starters_lines_sync(self, date_str: str) -> list[str]:
-        """Synchronous version for asyncio.to_thread -- avoids blocking the
-        event loop during the ~30 sequential API calls this makes."""
-        entries = mlb_api.get_probable_starters(date_str)
-        entries_by_team = {e["team_id"]: e for e in entries}
-        lines = []
-        for team in sorted(self.teams, key=lambda t: t["name"]):
-            entry = entries_by_team.get(team["id"])
-            if not entry:
-                lines.append(f"**{team['name']}**\nOff\n")
-                continue
-            if not entry["pitcher_id"]:
-                lines.append(f"**{team['name']}**\nProbable starter not yet announced\n")
-                continue
-
-            last_pitch_line = "No prior start logged this season yet"
-            try:
-                last = mlb_api.last_start_any_level(entry["pitcher_id"], as_of=date_str)
-                if last:
-                    last_pitch_line = format_last_start(last, date_str)
-            except Exception as e:
-                log.error("Game log lookup failed for %s: %s", entry["pitcher_name"], e)
-
-            lines.append(f"**{team['name']}**\n{entry['pitcher_name']} makes the start. {last_pitch_line}.\n")
-        return lines
-
-    async def _hotstarters_callback(self, interaction: discord.Interaction, date: str | None = None):
-        await self._hot_or_cold(interaction, date, want_tag="🔥 Hot", label="Hot", emoji="🔥")
-
-    async def _coldstarters_callback(self, interaction: discord.Interaction, date: str | None = None):
-        await self._hot_or_cold(interaction, date, want_tag="🥶 Cold", label="Cold", emoji="🥶")
-
-    async def _hot_or_cold(self, interaction: discord.Interaction, date: str | None, want_tag: str, label: str, emoji: str):
-        await interaction.response.defer()
-        date_str = date or et_date_str(0)
-
-        try:
-            entries = mlb_api.get_probable_starters(date_str)
-        except Exception as e:
-            await interaction.followup.send(f"Couldn't reach the MLB API right now: {e}")
-            return
-
-        result_lines = []
-        for entry in entries:
-            if not entry["pitcher_id"]:
-                continue
-            try:
-                splits = mlb_api.get_pitcher_game_log(entry["pitcher_id"])
-            except Exception as e:
-                log.error("Game log lookup failed for %s: %s", entry["pitcher_name"], e)
-                continue
-
-            last5 = stats.summarize_outings(splits, 5)
-            tag = stats.hot_cold_tag(last5)
-            if tag != want_tag or not last5:
-                continue
-
-            result_lines.append(
-                f"**{entry['pitcher_name']}** ({entry['team_name']}) — "
-                f"{last5['era']} ERA, {last5['k9']} K/9 over last {last5['count']} starts\n"
-            )
-
-        header = f"__**{emoji} {label} Starters — {date_str}**__\n\n"
-        if not result_lines:
-            await interaction.followup.send(header + "None qualify today.")
-            return
-        await self._send_chunked(interaction, header, result_lines)
-
-    async def _send_chunked(self, interaction: discord.Interaction, header: str, lines: list[str], limit: int = 1900):
-        chunk = header
-        first = True
-        for line in lines:
-            if len(chunk) + len(line) > limit:
-                await self._send_one(interaction, chunk, first)
-                chunk = ""
-                first = False
-            chunk += line + "\n"
-        if chunk.strip():
-            await self._send_one(interaction, chunk, first)
-
-    async def _send_one(self, interaction: discord.Interaction, content: str, is_first: bool):
-        if is_first:
-            await interaction.followup.send(content)
-        else:
-            await interaction.channel.send(content)
-
-    async def on_ready(self):
-        log.info("Logged in as %s", self.user)
-        if not poll_games.is_running():
-            poll_games.start(self)
-        if not refresh_directory_loop.is_running():
-            refresh_directory_loop.start(self)
-        if not watchdog.is_running():
-            watchdog.start()
-        if not scheduled_starters_post.is_running():
-            scheduled_starters_post.start(self)
-
-
-client = StartersBot()
-
-
-@tasks.loop(minutes=POLL_MINUTES)
-async def poll_games(bot: StartersBot):
-    try:
-        channel_id = storage.get_config("announce_channel_id")
-        if not channel_id:
-            return
-        channel = bot.get_channel(int(channel_id))
-        if channel is None:
-            return
-
-        for offset in (0, -1):
-            date_str = et_date_str(offset)
-            try:
-                games = mlb_api.get_live_games(date_str)
-            except Exception as e:
-                log.error("Failed to fetch schedule for %s: %s", date_str, e)
-                continue
-
-            for g in games:
-                if g["abstract_state"] != "Final":
-                    continue
-                if storage.is_game_posted(g["game_pk"]):
-                    continue
-                try:
-                    box = mlb_api.get_boxscore(g["game_pk"])
-                    starters = mlb_api.extract_starters(box)
-                except Exception as e:
-                    log.error("Failed to fetch/parse boxscore for game %s: %s", g["game_pk"], e)
-                    continue
-
-                storage.mark_game_posted(g["game_pk"])
-                try:
-                    await channel.send(embed=build_game_embed(g, starters))
-                    log.info("Posted starter report for game %s", g["game_pk"])
-                except Exception as e:
-                    log.error("Failed to send starter report for game %s: %s", g["game_pk"], e)
-    except Exception as e:
-        # Top-level safety net: discord.py's task loop permanently stops on
-        # any unhandled exception with no automatic restart. This guarantees
-        # that can never happen here -- worst case, this one cycle is
-        # skipped and logged, but the loop itself keeps running forever.
-        log.error("poll_games cycle failed unexpectedly, will retry next cycle: %s", e)
-
-
-@poll_games.before_loop
-async def before_poll():
-    await client.wait_until_ready()
-
-
-@tasks.loop(hours=ROSTER_REFRESH_HOURS)
-async def refresh_directory_loop(bot: StartersBot):
-    try:
-        await bot.refresh_player_directory()
-    except Exception as e:
-        log.error("refresh_directory_loop cycle failed unexpectedly, will retry next cycle: %s", e)
-
-
-@refresh_directory_loop.before_loop
-async def before_refresh():
-    await client.wait_until_ready()
-
-
-@tasks.loop(minutes=2)
-async def watchdog():
+    resp.raise_for_status()
+    data = resp.json()
+
+    entries = []
+    for date_entry in data.get("dates", []):
+        for g in date_entry.get("games", []):
+            for side in ("home", "away"):
+                team = g["teams"][side]["team"]
+                pp = g["teams"][side].get("probablePitcher")
+                entries.append({
+                    "team_id": team["id"],
+                    "team_name": team["name"],
+                    "pitcher_id": pp["id"] if pp else None,
+                    "pitcher_name": pp["fullName"] if pp else None,
+                })
+    return entries
+
+
+def get_roster_pitchers(team_id: int, roster_type: str = "active") -> list[dict]:
     """
-    Belt-and-suspenders: if either background loop somehow stops for any
-    reason not already caught above, this notices within 2 minutes and
-    restarts it -- rather than the bot going silently dark for the rest
-    of the day with no automatic recovery, which is what happened before
-    this was added.
+    Pitchers on a team's roster.
+
+    rosterType matters more than it looks. "active" excludes anyone on the
+    injured list -- which is exactly the population this bot cares about when
+    a guy is making a rehab start in the minors. Use "40Man" to include them.
     """
-    if not poll_games.is_running():
-        log.error("poll_games was found stopped -- restarting it now")
-        poll_games.start(client)
-    if not refresh_directory_loop.is_running():
-        log.error("refresh_directory_loop was found stopped -- restarting it now")
-        refresh_directory_loop.start(client)
-    if not scheduled_starters_post.is_running():
-        log.error("scheduled_starters_post was found stopped -- restarting it now")
-        scheduled_starters_post.start(client)
+    resp = requests.get(
+        f"{BASE}/teams/{team_id}/roster", params={"rosterType": roster_type}, timeout=15
+    )
+    resp.raise_for_status()
+    pitchers = []
+    for entry in resp.json().get("roster", []):
+        if (entry.get("position") or {}).get("abbreviation") == "P":
+            pitchers.append({"id": entry["person"]["id"], "name": entry["person"]["fullName"]})
+    return pitchers
 
 
-@watchdog.before_loop
-async def before_watchdog():
-    await client.wait_until_ready()
+def get_active_roster_pitchers(team_id: int) -> list[dict]:
+    """Back-compat alias. Prefer get_roster_pitchers."""
+    return get_roster_pitchers(team_id, "active")
 
 
-# 11 PM ET the night before, and 11 AM ET the day of -- approximated as
-# UTC-4 (matches the rest of this bot's ET handling; will drift by an hour
-# during EST in the off-season, same known limitation as elsewhere here).
-# 11 PM ET = 03:00 UTC (next day). 11 AM ET = 15:00 UTC.
-SCHEDULED_TIMES = [dtime(hour=3, minute=0), dtime(hour=15, minute=0)]
+def get_live_games(date_str: str) -> list[dict]:
+    resp = requests.get(
+        f"{BASE}/schedule", params={"sportId": 1, "date": date_str}, timeout=15
+    )
+    resp.raise_for_status()
+    games = []
+    for date_entry in resp.json().get("dates", []):
+        for g in date_entry.get("games", []):
+            games.append({
+                "game_pk": g["gamePk"],
+                "abstract_state": g["status"].get("abstractGameState"),
+                "home_team": g["teams"]["home"]["team"]["name"],
+                "away_team": g["teams"]["away"]["team"]["name"],
+            })
+    return games
 
 
-@tasks.loop(time=SCHEDULED_TIMES)
-async def scheduled_starters_post(bot: StartersBot):
-    try:
-        channel_id = storage.get_config("announce_channel_id")
-        if not channel_id:
-            return
-        channel = bot.get_channel(int(channel_id))
-        if channel is None:
-            return
+def get_boxscore(game_pk: int) -> dict:
+    resp = requests.get(f"{BASE}/game/{game_pk}/boxscore", timeout=15)
+    resp.raise_for_status()
+    return resp.json()
 
-        now_utc = datetime.now(timezone.utc)
-        if now_utc.hour < 6:
-            # This is the 02:00 UTC run (10 PM ET the night before) -- post TOMORROW's slate
-            date_str = et_date_str(1)
-            label = "Tomorrow's"
-        else:
-            # This is the 15:00 UTC run (11 AM ET day-of) -- post TODAY's slate
-            date_str = et_date_str(0)
-            label = "Today's"
 
+def extract_starters(boxscore_json: dict) -> dict:
+    """Returns {"home": {...starter line...}, "away": {...}} -- index 0 pitcher only."""
+    result = {}
+    for side in ("home", "away"):
+        team_block = boxscore_json["teams"][side]
+        team_name = team_block["team"]["name"]
+        pitcher_ids = team_block.get("pitchers", [])
+        players = team_block.get("players", {})
+
+        starter = None
+        if pitcher_ids:
+            p = players.get(f"ID{pitcher_ids[0]}")
+            if p:
+                pitching = (p.get("stats") or {}).get("pitching") or {}
+                starter = {
+                    "id": pitcher_ids[0],
+                    "name": p["person"]["fullName"],
+                    "pitches": pitching.get("numberOfPitches", pitching.get("pitchesThrown", 0)),
+                    "ip": pitching.get("inningsPitched", "0.0"),
+                    "hits": pitching.get("hits", 0),
+                    "er": pitching.get("earnedRuns", 0),
+                    "bb": pitching.get("baseOnBalls", 0),
+                    "so": pitching.get("strikeOuts", 0),
+                }
+        result[side] = {"team": team_name, "starter": starter}
+    return result
+
+
+def get_pitcher_game_log(
+    person_id: int, season: int = CURRENT_SEASON, sport_id: int = 1
+) -> list[dict]:
+    """
+    Most recent starts/appearances for one pitcher, via MLB's dedicated
+    game-log endpoint -- much cheaper than scanning box scores when you only
+    need one player's history.
+    """
+    resp = requests.get(
+        f"{BASE}/people/{person_id}/stats",
+        params={
+            "stats": "gameLog",
+            "group": "pitching",
+            "season": season,
+            "gameType": "R",
+            "sportId": sport_id,
+        },
+        timeout=15,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    splits = []
+    for stat_block in data.get("stats", []):
+        for split in stat_block.get("splits", []):
+            stat = split.get("stat", {}) or {}
+            splits.append({
+                "date": split.get("date"),
+                "opponent": (split.get("opponent") or {}).get("name"),
+                "is_home": split.get("isHome"),
+                "pitches": stat.get("numberOfPitches", stat.get("pitchesThrown", 0)),
+                "ip": stat.get("inningsPitched", "0.0"),
+                "hits": stat.get("hits", 0),
+                "er": stat.get("earnedRuns", 0),
+                "bb": stat.get("baseOnBalls", 0),
+                "so": stat.get("strikeOuts", 0),
+                "bf": stat.get("battersFaced", 0),
+                "is_start": bool(stat.get("gamesStarted")),
+                "decision": stat.get("decision") or stat.get("note"),
+            })
+
+    splits.sort(key=lambda s: s["date"] or "")
+    return splits
+
+
+# ---------------------------------------------------------------------------
+# Minor league support
+# ---------------------------------------------------------------------------
+# MLB's Stats API is the same feed behind mlb.com and milb.com. The gameLog
+# endpoint returns MLB only unless you pass an explicit sportId, which is why
+# a pitcher's Double-A rehab start looks like "no game log" to an MLB-only
+# query. These are the level ids we search, in descending order of level.
+LEVELS = {
+    1:  "MLB",
+    11: "Triple-A",
+    12: "Double-A",
+    13: "High-A",
+    14: "Single-A",
+    16: "Rookie",
+}
+MINOR_SPORT_IDS = [11, 12, 13, 14, 16]
+
+# Only go looking in the minors when the MLB log is empty or this stale.
+# Keeps /starters at one API call per pitcher on the normal path.
+STALE_START_DAYS = int(os.getenv("STALE_START_DAYS", "10"))
+
+
+def get_pitcher_game_log_multi(
+    person_id: int,
+    season: int = CURRENT_SEASON,
+    sport_ids: list[int] | None = None,
+) -> list[dict]:
+    """
+    Game log across several levels, merged and sorted oldest-first.
+
+    Each split carries the sport_id it came from plus a human "level" label,
+    so callers can say "in his last start in Triple-A" without a second lookup.
+    A level that errors or returns nothing is skipped -- one bad level must
+    never take down the whole lookup.
+    """
+    if sport_ids is None:
+        sport_ids = [1] + MINOR_SPORT_IDS
+
+    merged: list[dict] = []
+    for sid in sport_ids:
         try:
-            lines = await asyncio.to_thread(bot._build_starters_lines_sync, date_str)
-        except Exception as e:
-            log.error("Scheduled starters post failed to fetch data for %s: %s", date_str, e)
-            return
+            rows = get_pitcher_game_log(person_id, season=season, sport_id=sid)
+        except Exception:
+            continue
+        for r in rows:
+            r["sport_id"] = sid
+            r["level"] = LEVELS.get(sid, f"sportId {sid}")
+            merged.append(r)
 
-        header = f"__**{label} Probable Starters — {date_str}**__\n\n"
-        chunk = header
-        for line in lines:
-            if len(chunk) + len(line) > 1900:
-                await channel.send(chunk)
-                chunk = ""
-            chunk += line + "\n"
-        if chunk.strip():
-            await channel.send(chunk)
-        log.info("Posted scheduled starters report for %s", date_str)
-    except Exception as e:
-        log.error("scheduled_starters_post cycle failed unexpectedly, will retry next scheduled time: %s", e)
+    merged.sort(key=lambda s: (s["date"] or "", s.get("sport_id", 0)))
+    return merged
 
 
-@scheduled_starters_post.before_loop
-async def before_scheduled_starters_post():
-    await client.wait_until_ready()
+def last_start_any_level(
+    person_id: int,
+    as_of: str,
+    season: int = CURRENT_SEASON,
+    stale_days: int = None,
+) -> dict | None:
+    """
+    The pitcher's most recent START, wherever it happened.
+
+    Cheap path first: query MLB only. If that produces a start inside the
+    staleness window we stop there -- one API call, same cost as today. We
+    only pay for the minor league lookups when the MLB answer is missing or
+    old, which is exactly the case Mike cares about (guys coming back from
+    injury, or just called up).
+
+    Returns the split dict (with "level" and "sport_id") or None.
+    """
+    if stale_days is None:
+        stale_days = STALE_START_DAYS
+
+    def _last_start(rows):
+        starts = [s for s in rows if s.get("is_start")]
+        return starts[-1] if starts else None
+
+    try:
+        mlb_rows = get_pitcher_game_log(person_id, season=season, sport_id=1)
+    except Exception:
+        mlb_rows = []
+    for r in mlb_rows:
+        r["sport_id"] = 1
+        r["level"] = "MLB"
+
+    mlb_last = _last_start(mlb_rows)
+    if mlb_last and _days_between(mlb_last["date"], as_of) <= stale_days:
+        return mlb_last
+
+    # MLB answer is missing or stale -- now it's worth checking the minors.
+    minor_rows = get_pitcher_game_log_multi(person_id, season=season, sport_ids=MINOR_SPORT_IDS)
+    minor_last = _last_start(minor_rows)
+
+    if mlb_last and minor_last:
+        return minor_last if minor_last["date"] > mlb_last["date"] else mlb_last
+    return minor_last or mlb_last
 
 
-if __name__ == "__main__":
-    if not TOKEN:
-        raise SystemExit("Set DISCORD_TOKEN in your .env file (see .env.example).")
-    client.run(TOKEN)
+def _days_between(earlier: str, later: str) -> int:
+    from datetime import datetime as _dt
+    try:
+        return (_dt.strptime(later, "%Y-%m-%d") - _dt.strptime(earlier, "%Y-%m-%d")).days
+    except Exception:
+        return 10 ** 6
+
+
+
+# ---------------------------------------------------------------------------
+# Player index -- the fallback when a name isn't on any MLB roster
+# ---------------------------------------------------------------------------
+# The autocomplete directory is built from MLB rosters, so it cannot see a
+# pure minor leaguer, and (with rosterType "active") it cannot see anyone on
+# the IL either. This index is the safety net: one cheap call per level,
+# cached, covering MLB + Triple-A + Double-A.
+PLAYER_INDEX_SPORT_IDS = [1, 11, 12]
+_player_index_cache: dict = {}
+
+
+def get_player_index(season: int = CURRENT_SEASON, sport_ids: list[int] = None,
+                     allow_fetch: bool = True) -> list[dict]:
+    """
+    All players at the given levels for a season: [{id, name, level, sport_id}].
+    Cached per (season, levels) -- these lists change slowly and the whole
+    point is to avoid paying for them on every lookup.
+
+    allow_fetch=False returns whatever is already cached and NEVER makes a
+    network call. Discord autocomplete has a ~3 second budget and fires on
+    every keystroke, so it must never be the thing that warms this cache.
+    """
+    if sport_ids is None:
+        sport_ids = PLAYER_INDEX_SPORT_IDS
+    key = (season, tuple(sport_ids))
+    if key in _player_index_cache:
+        return _player_index_cache[key]
+    if not allow_fetch:
+        return []
+
+    out: list[dict] = []
+    seen: set[int] = set()
+    for sid in sport_ids:
+        try:
+            resp = requests.get(
+                f"{BASE}/sports/{sid}/players", params={"season": season}, timeout=30
+            )
+            resp.raise_for_status()
+            people = resp.json().get("people", [])
+        except Exception:
+            continue
+        for p in people:
+            pid = p.get("id")
+            if pid is None or pid in seen:
+                continue
+            seen.add(pid)
+            out.append({
+                "id": pid,
+                "name": p.get("fullName", ""),
+                "level": LEVELS.get(sid, f"sportId {sid}"),
+                "sport_id": sid,
+                "position": ((p.get("primaryPosition") or {}).get("abbreviation") or ""),
+            })
+    if out:
+        _player_index_cache[key] = out
+    return out
+
+
+def find_pitchers(name: str, season: int = CURRENT_SEASON,
+                  allow_fetch: bool = True) -> list[dict]:
+    """
+    Substring name search across the player index, pitchers first.
+    Returns [] rather than raising -- callers decide how to report a miss.
+    """
+    needle = (name or "").strip().lower()
+    if not needle:
+        return []
+    idx = get_player_index(season, allow_fetch=allow_fetch)
+    matches = [p for p in idx if needle in p["name"].lower()]
+    matches.sort(key=lambda p: (p["position"] != "P", p["sport_id"], p["name"]))
+    return matches
+
+
+def clear_player_index_cache():
+    _player_index_cache.clear()
+
+
+def warm_player_index(season: int = CURRENT_SEASON) -> int:
+    """
+    Populate the index cache up front so autocomplete can use it immediately.
+    Returns how many players are cached. Safe to call repeatedly.
+    """
+    return len(get_player_index(season, allow_fetch=True))
