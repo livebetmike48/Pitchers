@@ -300,14 +300,53 @@ class StartersBot(discord.Client):
         self.player_directory = directory
         log.info("Player directory refreshed: %d pitchers (active + 40-man)", len(directory))
 
+        # Warm the cross-level index here, on the slow path, so autocomplete
+        # can search MLB + Triple-A + Double-A without ever making a network
+        # call inside Discord's ~3 second autocomplete budget.
+        try:
+            n = await asyncio.to_thread(mlb_api.warm_player_index)
+            log.info("Player index warmed: %d players across MLB/AAA/AA", n)
+        except Exception as e:
+            log.error("Player index warm failed (autocomplete falls back to rosters): %s", e)
+
     async def _name_autocomplete(self, interaction: discord.Interaction, current: str):
-        current_lower = current.lower()
-        matches = [p for p in self.player_directory if current_lower in p["name"].lower()]
-        matches = matches[:25]
-        return [
-            app_commands.Choice(name=f"{p['name']} ({p['team']})", value=str(p["id"]))
-            for p in matches
-        ]
+        """
+        Suggestions come from the MLB roster directory FIRST, then from the
+        cross-level player index (Triple-A / Double-A). Without the second
+        source a rehabbing or not-yet-called-up pitcher never appears in the
+        dropdown, so there is no way to reach him at all -- the whole point
+        of the minor league lookup.
+
+        Never fetches: allow_fetch=False means a cold cache just yields the
+        roster names rather than blowing Discord's autocomplete timeout.
+        """
+        current_lower = (current or "").lower()
+        choices: list[app_commands.Choice] = []
+        seen: set[int] = set()
+
+        for p in self.player_directory:
+            if current_lower in p["name"].lower():
+                seen.add(p["id"])
+                choices.append(
+                    app_commands.Choice(name=f"{p['name']} ({p['team']})", value=str(p["id"]))
+                )
+                if len(choices) >= 25:
+                    return choices
+
+        if current_lower:
+            try:
+                extra = mlb_api.find_pitchers(current_lower, allow_fetch=False)
+            except Exception:
+                extra = []
+            for p in extra:
+                if p["id"] in seen:
+                    continue
+                seen.add(p["id"])
+                label = f"{p['name']} ({p['level']})"
+                choices.append(app_commands.Choice(name=label[:100], value=str(p["id"])))
+                if len(choices) >= 25:
+                    break
+        return choices
 
     def _resolve_pitcher(self, name: str):
         """`name` is the person_id if picked from autocomplete; falls back to a
