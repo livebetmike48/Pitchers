@@ -26,9 +26,19 @@ def fake_log(mapping):
 
 
 def fake_index(rows):
-    def _f(season=mlb_api.CURRENT_SEASON, sport_ids=None):
+    def _f(season=mlb_api.CURRENT_SEASON, sport_ids=None, allow_fetch=True):
         return rows
     return _f
+
+
+_REAL_INDEX = mlb_api.get_player_index
+
+
+def restore_index():
+    """Each test monkeypatches globals; put the real one back so tests can't
+    leak into each other (that leak is exactly how the first version of this
+    file went wrong)."""
+    mlb_api.get_player_index = _REAL_INDEX
 
 
 def run(name, fn):
@@ -171,13 +181,53 @@ def t_unknown_name_returns_empty_not_error():
 def t_blank_name_short_circuits():
     hits = []
 
-    def counting(season=mlb_api.CURRENT_SEASON, sport_ids=None):
+    def counting(season=mlb_api.CURRENT_SEASON, sport_ids=None, allow_fetch=True):
         hits.append(1)
         return []
 
     mlb_api.get_player_index = counting
-    assert mlb_api.find_pitchers("   ") == []
-    assert not hits, "should not hit the index for a blank name"
+    try:
+        assert mlb_api.find_pitchers("   ") == []
+        assert not hits, "should not hit the index for a blank name"
+    finally:
+        restore_index()
+
+
+
+# --- autocomplete-facing behaviour ----------------------------------------
+
+def t_index_never_fetches_when_not_allowed():
+    """Autocomplete must not warm a cold cache -- Discord times out at ~3s."""
+    restore_index()
+    mlb_api.clear_player_index_cache()
+    hits = []
+
+    class Boom:
+        def get(self, *a, **k):
+            hits.append(1)
+            raise AssertionError("autocomplete made a network call")
+
+    real = mlb_api.requests
+    mlb_api.requests = Boom()
+    try:
+        assert mlb_api.get_player_index(allow_fetch=False) == []
+        assert mlb_api.find_pitchers("lopez", allow_fetch=False) == []
+        assert not hits
+    finally:
+        mlb_api.requests = real
+
+
+def t_warmed_index_is_searchable_without_fetching():
+    restore_index()
+    mlb_api.clear_player_index_cache()
+    rows = [
+        {"id": 1, "name": "Reynaldo Lopez", "level": "Triple-A", "sport_id": 11, "position": "P"},
+    ]
+    mlb_api._player_index_cache[(mlb_api.CURRENT_SEASON,
+                                 tuple(mlb_api.PLAYER_INDEX_SPORT_IDS))] = rows
+    got = mlb_api.find_pitchers("lopez", allow_fetch=False)
+    assert got and got[0]["level"] == "Triple-A", got
+    mlb_api.clear_player_index_cache()
 
 
 TESTS = [
@@ -196,6 +246,8 @@ TESTS = [
     ("MLB ranks above minors on name ties", t_mlb_ranks_above_minors_on_ties),
     ("unknown name returns empty, not an error", t_unknown_name_returns_empty_not_error),
     ("blank name never hits the index", t_blank_name_short_circuits),
+    ("autocomplete never makes a network call", t_index_never_fetches_when_not_allowed),
+    ("warmed index is searchable without fetching", t_warmed_index_is_searchable_without_fetching),
 ]
 
 if __name__ == "__main__":
