@@ -46,9 +46,16 @@ def get_probable_starters(date_str: str) -> list[dict]:
     return entries
 
 
-def get_active_roster_pitchers(team_id: int) -> list[dict]:
+def get_roster_pitchers(team_id: int, roster_type: str = "active") -> list[dict]:
+    """
+    Pitchers on a team's roster.
+
+    rosterType matters more than it looks. "active" excludes anyone on the
+    injured list -- which is exactly the population this bot cares about when
+    a guy is making a rehab start in the minors. Use "40Man" to include them.
+    """
     resp = requests.get(
-        f"{BASE}/teams/{team_id}/roster", params={"rosterType": "active"}, timeout=15
+        f"{BASE}/teams/{team_id}/roster", params={"rosterType": roster_type}, timeout=15
     )
     resp.raise_for_status()
     pitchers = []
@@ -56,6 +63,11 @@ def get_active_roster_pitchers(team_id: int) -> list[dict]:
         if (entry.get("position") or {}).get("abbreviation") == "P":
             pitchers.append({"id": entry["person"]["id"], "name": entry["person"]["fullName"]})
     return pitchers
+
+
+def get_active_roster_pitchers(team_id: int) -> list[dict]:
+    """Back-compat alias. Prefer get_roster_pitchers."""
+    return get_roster_pitchers(team_id, "active")
 
 
 def get_live_games(date_str: str) -> list[dict]:
@@ -258,3 +270,73 @@ def _days_between(earlier: str, later: str) -> int:
         return (_dt.strptime(later, "%Y-%m-%d") - _dt.strptime(earlier, "%Y-%m-%d")).days
     except Exception:
         return 10 ** 6
+
+
+
+# ---------------------------------------------------------------------------
+# Player index -- the fallback when a name isn't on any MLB roster
+# ---------------------------------------------------------------------------
+# The autocomplete directory is built from MLB rosters, so it cannot see a
+# pure minor leaguer, and (with rosterType "active") it cannot see anyone on
+# the IL either. This index is the safety net: one cheap call per level,
+# cached, covering MLB + Triple-A + Double-A.
+PLAYER_INDEX_SPORT_IDS = [1, 11, 12]
+_player_index_cache: dict = {}
+
+
+def get_player_index(season: int = CURRENT_SEASON, sport_ids: list[int] = None) -> list[dict]:
+    """
+    All players at the given levels for a season: [{id, name, level, sport_id}].
+    Cached per (season, levels) -- these lists change slowly and the whole
+    point is to avoid paying for them on every lookup.
+    """
+    if sport_ids is None:
+        sport_ids = PLAYER_INDEX_SPORT_IDS
+    key = (season, tuple(sport_ids))
+    if key in _player_index_cache:
+        return _player_index_cache[key]
+
+    out: list[dict] = []
+    seen: set[int] = set()
+    for sid in sport_ids:
+        try:
+            resp = requests.get(
+                f"{BASE}/sports/{sid}/players", params={"season": season}, timeout=30
+            )
+            resp.raise_for_status()
+            people = resp.json().get("people", [])
+        except Exception:
+            continue
+        for p in people:
+            pid = p.get("id")
+            if pid is None or pid in seen:
+                continue
+            seen.add(pid)
+            out.append({
+                "id": pid,
+                "name": p.get("fullName", ""),
+                "level": LEVELS.get(sid, f"sportId {sid}"),
+                "sport_id": sid,
+                "position": ((p.get("primaryPosition") or {}).get("abbreviation") or ""),
+            })
+    if out:
+        _player_index_cache[key] = out
+    return out
+
+
+def find_pitchers(name: str, season: int = CURRENT_SEASON) -> list[dict]:
+    """
+    Substring name search across the player index, pitchers first.
+    Returns [] rather than raising -- callers decide how to report a miss.
+    """
+    needle = (name or "").strip().lower()
+    if not needle:
+        return []
+    idx = get_player_index(season)
+    matches = [p for p in idx if needle in p["name"].lower()]
+    matches.sort(key=lambda p: (p["position"] != "P", p["sport_id"], p["name"]))
+    return matches
+
+
+def clear_player_index_cache():
+    _player_index_cache.clear()
