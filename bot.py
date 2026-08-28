@@ -30,6 +30,38 @@ def et_date_str(offset_days: int = 0) -> str:
     return et.strftime("%Y-%m-%d")
 
 
+
+def format_last_start(last: dict, as_of: str) -> str:
+    """
+    One line describing a pitcher's most recent start, wherever it happened.
+
+    MLB starts read exactly as they always have -- the level phrase is added
+    only when the start was somewhere other than the big leagues:
+
+        Threw 81 pitches in his last start (2026-08-16, 5 days rest)
+        Threw 81 pitches in his last start in Triple-A (2026-08-16, 5 days rest)
+
+    Days of rest stays on every line on purpose: it is what makes a stale
+    reading visible instead of silent.
+    """
+    rest_days = (
+        datetime.strptime(as_of, "%Y-%m-%d") - datetime.strptime(last["date"], "%Y-%m-%d")
+    ).days - 1
+    rest_str = f", {rest_days} days rest" if rest_days >= 0 else ""
+
+    level = last.get("level", "MLB")
+    where = "" if level == "MLB" else f" in {level}"
+
+    pitches = last.get("pitches")
+    if not pitches:
+        # Never invent a pitch count. Some minor league lines omit it.
+        return (
+            f"Last start{where} was {last['date']}{rest_str} "
+            f"({last.get('ip', '0.0')} IP, pitch count not reported)"
+        )
+    return f"Threw {pitches} pitches in his last start{where} ({last['date']}{rest_str})"
+
+
 def build_game_embed(game: dict, starters: dict) -> discord.Embed:
     away, home = starters["away"], starters["home"]
     embed = discord.Embed(
@@ -191,6 +223,14 @@ class StartersBot(discord.Client):
         )
         self.tree.add_command(setchannel_cmd)
 
+        laststart_cmd = app_commands.Command(
+            name="laststart",
+            description="Diagnostic: most recent start at ANY level (MLB/AAA/AA/A/Rookie)",
+            callback=self._laststart_callback,
+        )
+        self.tree.add_command(laststart_cmd)
+        laststart_cmd.autocomplete("name")(self._name_autocomplete)
+
         starters_cmd = app_commands.Command(
             name="starters",
             description="Probable starters for a date (YYYY-MM-DD, blank = today), with last pitch count",
@@ -310,6 +350,56 @@ class StartersBot(discord.Client):
             return
         await interaction.followup.send(embed=build_pitcher_embed(pitcher_name, splits))
 
+    async def _laststart_callback(self, interaction: discord.Interaction, name: str):
+        """
+        Verification surface. Shows, per level, what the API actually returned
+        and which start won -- so a wrong answer is visible instead of quietly
+        wrong inside the automated starters post.
+        """
+        await interaction.response.defer()
+        person_id, resolved = self._resolve_pitcher(name)
+        if not person_id:
+            await interaction.followup.send(f"Couldn't find a pitcher named '{name}'.")
+            return
+
+        today = et_date_str(0)
+        try:
+            per_level = await asyncio.to_thread(self._laststart_probe_sync, person_id)
+            last = await asyncio.to_thread(
+                mlb_api.last_start_any_level, person_id, today
+            )
+        except Exception as e:
+            await interaction.followup.send(f"Lookup failed: {e}")
+            return
+
+        embed = discord.Embed(
+            title=f"{resolved} — last start, any level",
+            description=format_last_start(last, today) + "." if last
+            else "No start found at any level this season.",
+            color=discord.Color.blue() if last else discord.Color.light_grey(),
+        )
+        rows = []
+        for sid, label, n_starts, latest in per_level:
+            if n_starts:
+                rows.append(f"**{label}** (sportId {sid}): {n_starts} starts, latest {latest}")
+            else:
+                rows.append(f"{label} (sportId {sid}): —")
+        embed.add_field(name="What each level returned", value="\n".join(rows), inline=False)
+        embed.set_footer(text="Data: MLB Stats API (same feed as mlb.com / milb.com)")
+        await interaction.followup.send(embed=embed)
+
+    def _laststart_probe_sync(self, person_id: int):
+        out = []
+        for sid, label in mlb_api.LEVELS.items():
+            try:
+                rows = mlb_api.get_pitcher_game_log(person_id, sport_id=sid)
+            except Exception:
+                out.append((sid, label, 0, "lookup failed"))
+                continue
+            starts = [r for r in rows if r.get("is_start")]
+            out.append((sid, label, len(starts), starts[-1]["date"] if starts else "—"))
+        return out
+
     async def _setchannel_callback(self, interaction: discord.Interaction):
         storage.set_config("announce_channel_id", str(interaction.channel_id))
         await interaction.response.send_message(
@@ -346,15 +436,9 @@ class StartersBot(discord.Client):
 
             last_pitch_line = "No prior start logged this season yet"
             try:
-                splits = mlb_api.get_pitcher_game_log(entry["pitcher_id"])
-                starts = [s for s in splits if s["is_start"]]
-                if starts:
-                    last = starts[-1]
-                    rest_days = (
-                        datetime.strptime(date_str, "%Y-%m-%d") - datetime.strptime(last["date"], "%Y-%m-%d")
-                    ).days - 1
-                    rest_str = f", {rest_days} days rest" if rest_days >= 0 else ""
-                    last_pitch_line = f"Threw {last['pitches']} pitches in his last start ({last['date']}{rest_str})"
+                last = mlb_api.last_start_any_level(entry["pitcher_id"], as_of=date_str)
+                if last:
+                    last_pitch_line = format_last_start(last, date_str)
             except Exception as e:
                 log.error("Game log lookup failed for %s: %s", entry["pitcher_name"], e)
 
