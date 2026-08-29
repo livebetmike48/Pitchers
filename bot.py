@@ -752,15 +752,27 @@ def due_slots(now_et: datetime) -> list[tuple[str, str, str, str]]:
     return out
 
 
+_sched_state = {"warned": None}
+
+
 @tasks.loop(minutes=5)
 async def scheduled_starters_post(bot: StartersBot):
     try:
         channel_id = storage.get_config("announce_channel_id")
         if not channel_id:
+            # Loud, once per boot: this exact silent return is how the
+            # Aug 28 11 PM post vanished with nothing in the log.
+            if _sched_state["warned"] != "no_config":
+                _sched_state["warned"] = "no_config"
+                log.error("scheduled starters: announce channel NOT CONFIGURED — run /setchannel in the target channel; nothing will post until then")
             return
         channel = bot.get_channel(int(channel_id))
         if channel is None:
+            if _sched_state["warned"] != channel_id:
+                _sched_state["warned"] = channel_id
+                log.error("scheduled starters: channel %s not found/visible to the bot — check it still exists and the bot can see it; nothing will post until fixed", channel_id)
             return
+        _sched_state["warned"] = None
 
         now_et = datetime.now(timezone.utc) - timedelta(hours=4)
         for name, slot_date, slate_date, label in due_slots(now_et):
