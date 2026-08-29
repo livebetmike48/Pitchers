@@ -1,7 +1,7 @@
 import os
 import logging
 import asyncio
-from datetime import datetime, timedelta, timezone, time as dtime
+from datetime import datetime, timedelta, timezone
 
 import discord
 from discord import app_commands
@@ -30,6 +30,27 @@ def et_date_str(offset_days: int = 0) -> str:
     return et.strftime("%Y-%m-%d")
 
 
+
+
+def parse_date_arg(date: str | None) -> tuple[str | None, str | None]:
+    """
+    Validate a user-typed date argument BEFORE it reaches a URL.
+
+    Returns (date_str, error). Blank -> today ET. Accepts YYYY-MM-DD only;
+    anything else comes back as a friendly error instead of the raw 400 the
+    MLB API throws at a malformed date (e.g. '2026-08-2029').
+    """
+    if not date or not date.strip():
+        return et_date_str(0), None
+    d = date.strip()
+    try:
+        datetime.strptime(d, "%Y-%m-%d")
+        return d, None
+    except ValueError:
+        return None, (
+            f"`{d}` isn't a date I can use — format is `YYYY-MM-DD` "
+            f"(today is `{et_date_str(0)}`), or leave it blank for today."
+        )
 
 def format_last_start(last: dict, as_of: str) -> str:
     """
@@ -486,7 +507,10 @@ class StartersBot(discord.Client):
 
     async def _starters_callback(self, interaction: discord.Interaction, date: str | None = None):
         await interaction.response.defer()
-        date_str = date or et_date_str(0)
+        date_str, err = parse_date_arg(date)
+        if err:
+            await interaction.followup.send(err)
+            return
 
         try:
             lines = await asyncio.to_thread(self._build_starters_lines_sync, date_str)
@@ -531,7 +555,10 @@ class StartersBot(discord.Client):
 
     async def _hot_or_cold(self, interaction: discord.Interaction, date: str | None, want_tag: str, label: str, emoji: str):
         await interaction.response.defer()
-        date_str = date or et_date_str(0)
+        date_str, err = parse_date_arg(date)
+        if err:
+            await interaction.followup.send(err)
+            return
 
         try:
             entries = mlb_api.get_probable_starters(date_str)
@@ -685,14 +712,47 @@ async def before_watchdog():
     await client.wait_until_ready()
 
 
-# 11 PM ET the night before, and 11 AM ET the day of -- approximated as
-# UTC-4 (matches the rest of this bot's ET handling; will drift by an hour
-# during EST in the off-season, same known limitation as elsewhere here).
-# 11 PM ET = 03:00 UTC (next day). 11 AM ET = 15:00 UTC.
-SCHEDULED_TIMES = [dtime(hour=3, minute=0), dtime(hour=15, minute=0)]
+# Scheduled slate posts: 11 PM ET (tomorrow's slate) and 11 AM ET (today's).
+# ET approximated as UTC-4, matching the rest of this bot (known off-season
+# drift limitation, same as elsewhere).
+#
+# WHY THIS IS A POLLING LOOP AND NOT A time=... LOOP: discord.py's
+# wall-clock loops fire only if the bot is RUNNING at that exact moment.
+# Railway redeploys on every push, and a restart that straddles the
+# scheduled minute silently skips the post -- no error, loop reports
+# healthy, nothing until the next slot. That is exactly how the Aug 28
+# 11 PM post went missing. This loop instead asks every 5 minutes "is a
+# slot due and not yet posted?", with the posted-marker persisted in
+# SQLite -- so a restart can neither skip a post (caught within ~5 min of
+# boot, up to CATCHUP_HOURS late) nor double-post (marker survives).
+SLOTS = [
+    # (name, ET hour it becomes due, slate date offset from the slot's day, label)
+    ("night",   23, 1, "Tomorrow's"),
+    ("morning", 11, 0, "Today's"),
+]
+CATCHUP_HOURS = 6
 
 
-@tasks.loop(time=SCHEDULED_TIMES)
+def due_slots(now_et: datetime) -> list[tuple[str, str, str, str]]:
+    """
+    Slots currently inside their [due, due+CATCHUP_HOURS] window.
+    Returns (slot_name, slot_date, slate_date, label). Checks the slot on
+    both today's and yesterday's calendar day so a window that crosses
+    midnight (the 11 PM slot) still resolves after 12.
+    """
+    out = []
+    for name, hour, offset, label in SLOTS:
+        for day_back in (0, 1):
+            slot_day = (now_et - timedelta(days=day_back)).date()
+            slot_dt = datetime(slot_day.year, slot_day.month, slot_day.day,
+                               hour, tzinfo=now_et.tzinfo)
+            if slot_dt <= now_et < slot_dt + timedelta(hours=CATCHUP_HOURS):
+                slate = (slot_dt + timedelta(days=offset)).strftime("%Y-%m-%d")
+                out.append((name, slot_day.strftime("%Y-%m-%d"), slate, label))
+    return out
+
+
+@tasks.loop(minutes=5)
 async def scheduled_starters_post(bot: StartersBot):
     try:
         channel_id = storage.get_config("announce_channel_id")
@@ -702,34 +762,33 @@ async def scheduled_starters_post(bot: StartersBot):
         if channel is None:
             return
 
-        now_utc = datetime.now(timezone.utc)
-        if now_utc.hour < 6:
-            # This is the 02:00 UTC run (10 PM ET the night before) -- post TOMORROW's slate
-            date_str = et_date_str(1)
-            label = "Tomorrow's"
-        else:
-            # This is the 15:00 UTC run (11 AM ET day-of) -- post TODAY's slate
-            date_str = et_date_str(0)
-            label = "Today's"
+        now_et = datetime.now(timezone.utc) - timedelta(hours=4)
+        for name, slot_date, slate_date, label in due_slots(now_et):
+            marker = f"starters_{name}_last"
+            if storage.get_config(marker) == slot_date:
+                continue
+            # Mark BEFORE sending (poll_games pattern): a partial failure
+            # costs one post, never a channel full of duplicates.
+            storage.set_config(marker, slot_date)
 
-        try:
-            lines = await asyncio.to_thread(bot._build_starters_lines_sync, date_str)
-        except Exception as e:
-            log.error("Scheduled starters post failed to fetch data for %s: %s", date_str, e)
-            return
+            try:
+                lines = await asyncio.to_thread(bot._build_starters_lines_sync, slate_date)
+            except Exception as e:
+                log.error("Scheduled starters post failed to fetch data for %s: %s", slate_date, e)
+                continue
 
-        header = f"__**{label} Probable Starters — {date_str}**__\n\n"
-        chunk = header
-        for line in lines:
-            if len(chunk) + len(line) > 1900:
+            header = f"__**{label} Probable Starters — {slate_date}**__\n\n"
+            chunk = header
+            for line in lines:
+                if len(chunk) + len(line) > 1900:
+                    await channel.send(chunk)
+                    chunk = ""
+                chunk += line + "\n"
+            if chunk.strip():
                 await channel.send(chunk)
-                chunk = ""
-            chunk += line + "\n"
-        if chunk.strip():
-            await channel.send(chunk)
-        log.info("Posted scheduled starters report for %s", date_str)
+            log.info("Posted scheduled starters report (%s slot %s) for %s", name, slot_date, slate_date)
     except Exception as e:
-        log.error("scheduled_starters_post cycle failed unexpectedly, will retry next scheduled time: %s", e)
+        log.error("scheduled_starters_post cycle failed unexpectedly, will retry next cycle: %s", e)
 
 
 @scheduled_starters_post.before_loop
